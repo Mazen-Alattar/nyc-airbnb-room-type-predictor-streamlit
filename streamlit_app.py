@@ -1,7 +1,7 @@
-from pathlib import Path
+import json
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
 
-import joblib
-import pandas as pd
 import streamlit as st
 
 
@@ -12,24 +12,7 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-MODEL_PATH = Path(__file__).resolve().parent / "Model_Pipeline.pkl"
-FEATURE_COLUMNS = [
-    "latitude",
-    "longitude",
-    "price",
-    "minimum_nights",
-    "number_of_reviews",
-    "reviews_per_month",
-    "calculated_host_listings_count",
-    "availability_365",
-    "neighbourhood_group",
-    "neighbourhood",
-]
-ROOM_COLORS = {
-    "Entire home/apt": "#f4b860",
-    "Private room": "#4fd1c5",
-    "Shared room": "#e07a5f",
-}
+DEFAULT_API_URL = "https://nyc-airbnb-room-type-predictor-go93.onrender.com"
 EXAMPLES = {
     "Manhattan / Midtown": {
         "latitude": 40.7484,
@@ -70,13 +53,6 @@ EXAMPLES = {
 }
 
 
-@st.cache_resource(show_spinner="Loading the trained model...")
-def load_model():
-    if not MODEL_PATH.exists():
-        raise FileNotFoundError(f"Model artifact not found: {MODEL_PATH.name}")
-    return joblib.load(MODEL_PATH)
-
-
 def inject_styles() -> None:
     st.markdown(
         """
@@ -103,15 +79,27 @@ def inject_styles() -> None:
     )
 
 
-def prediction_frame(values: dict) -> pd.DataFrame:
-    return pd.DataFrame([values], columns=FEATURE_COLUMNS)
+def predict_from_api(api_url: str, values: dict) -> dict:
+    request = Request(
+        f"{api_url.rstrip('/')}/predict",
+        data=json.dumps(values).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urlopen(request, timeout=30) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except HTTPError as error:
+        detail = error.read().decode("utf-8")
+        raise RuntimeError(f"Backend rejected the request: {detail}") from error
+    except URLError as error:
+        raise RuntimeError(f"Could not reach the FastAPI backend: {error.reason}") from error
 
 
-def show_prediction(model, values: dict) -> None:
-    row = prediction_frame(values)
-    prediction = model.predict(row)[0]
-    probabilities = model.predict_proba(row)[0]
-    classes = list(model.classes_)
+def show_prediction(result: dict) -> None:
+    prediction = result["Predicted_room_type"]
+    probabilities = result["Probability"]
+    classes = ["Entire home/apt", "Private room", "Shared room"]
     probability_map = dict(zip(classes, probabilities))
 
     st.markdown(
@@ -135,14 +123,9 @@ def main() -> None:
         unsafe_allow_html=True,
     )
 
-    try:
-        model = load_model()
-    except (FileNotFoundError, OSError, ValueError) as error:
-        st.error(f"Unable to load the model: {error}")
-        st.stop()
-
     with st.sidebar:
         st.header("Quick start")
+        api_url = st.text_input("FastAPI backend URL", DEFAULT_API_URL).strip()
         example_name = st.selectbox("Load an example", ["None", *EXAMPLES])
         if st.button("Use selected example", use_container_width=True) and example_name != "None":
             st.session_state["example"] = EXAMPLES[example_name]
@@ -172,7 +155,8 @@ def main() -> None:
         submitted = st.form_submit_button("Predict room type", type="primary", use_container_width=True)
 
     if submitted:
-        if not neighbourhood.strip():
+        neighbourhood_value = (neighbourhood or "").strip()
+        if not neighbourhood_value:
             st.error("Enter a neighbourhood before predicting.")
         else:
             values = {
@@ -185,11 +169,15 @@ def main() -> None:
                 "calculated_host_listings_count": calculated_host_listings_count,
                 "availability_365": availability_365,
                 "neighbourhood_group": neighbourhood_group,
-                "neighbourhood": neighbourhood.strip(),
+                "neighbourhood": neighbourhood_value,
             }
             left, right = st.columns([1, 1.2])
             with left:
-                show_prediction(model, values)
+                try:
+                    result = predict_from_api(api_url, values)
+                    show_prediction(result)
+                except (KeyError, TypeError, ValueError, RuntimeError) as error:
+                    st.error(str(error))
             with right:
                 st.subheader("How to read this")
                 st.write("The bars show the model's probability for each room type. The prediction is the class with the highest probability.")
